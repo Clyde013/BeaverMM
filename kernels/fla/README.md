@@ -1,0 +1,2 @@
+This subfolder contains code from Songlin's FLA repo for benchmarking purposes.
+Minimalist reproduction that mainly contains https://github.com/sustcsonglin/flash-linear-attention/blob/main/fla/ops/rwkv6/chunk.py and the additional custom helper scripts that it imports.
