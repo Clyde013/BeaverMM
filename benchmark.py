@@ -8,9 +8,16 @@ import triton
 import triton.language as tl
 from triton.runtime import driver
 
-from kernels.beaver_kernel import rwkv_inner, kernel_lbmm_fwd
+from kernels.beaver_kernel import kernel_lbmm_fwd
+from kernels.beaver_kernel import rwkv_inner as rwkv_inner_triton
+
+from kernels.fla.fla_rwkv6 import chunk_rwkv6 as rwkv_fla
+
+from kernels.pt_kernel import rwkv_inner as rwkv_inner_pt
+from kernels.pt_kernel import rwkv_inner_compiled as rwkv_inner_pt_compiled
 
 if __name__ == '__main__':    
+    
     # checking gradients of backward implementation
     # uncomment two parts above, one in kernel for float64 and one in the do_log part of rwkv_inner
     torch.manual_seed(42)
@@ -32,7 +39,6 @@ if __name__ == '__main__':
     rwkv_inner( r, k, v, w, u, kv_states, chunk_len, 64, True )
     """
     # Speed benchmark
-    ref_lib = 'Torch' 
     
     bench_configs = []
     
@@ -43,9 +49,9 @@ if __name__ == '__main__':
             line_arg="provider",  # Argument name whose value corresponds to a different line in the plot
             # Possible values for `line_arg`
             # Don't compare to cublas for fp8 cases as torch.matmul doesn't support fp8 at the moment.
-            line_vals=[ref_lib.lower(), "triton"],  # Label name for the lines
-            line_names=[ref_lib, "Triton"],  # Line styles
-            styles=[("green", "-"), ("blue", "-")],
+            line_vals=["torch", "torch_compiled", "triton", "fla"],  # Label name for the lines
+            line_names=["Torch", "Torch_Compiled", "Triton", "FLA"],  # Line styles
+            styles=[("green", "-"), ("green", "-."), ("blue", "-"), ("red", "-")],
             ylabel="TFLOPS",  # Label name for the y-axis
             plot_name="matmul-performance-k64",
             args={ 'K': 64 }
@@ -68,22 +74,34 @@ if __name__ == '__main__':
         
 
         def bmm():
-            return rwkv_inner( r, k, v, w, u, kv_states, chunk_len, 64, False )
+            return rwkv_inner_pt( r, k, v, w, u, kv_states, chunk_len, 64 )
+        
+        def bmm_compiled():
+            return rwkv_inner_pt_compiled( r, k, v, w, u, kv_states, chunk_len, 64 )
         
         def lbmm():
-            return rwkv_inner( r, k, v, w, u, kv_states, chunk_len, 32, True )
+            return rwkv_inner_triton( r, k, v, w, u, kv_states, chunk_len, 32 )
+        
+        def fla():
+            return rwkv_fla( r, k, v, w, u, None, kv_states )
         
         quantiles = [0.5, 0.2, 0.8]
-        if provider == ref_lib.lower():
+        if provider == 'torch':
             ms, min_ms, max_ms = triton.testing.do_bench(lambda: bmm(), quantiles=quantiles)
+        if provider == 'torch_compiled':
+            ms, min_ms, max_ms = triton.testing.do_bench(lambda: bmm_compiled(), quantiles=quantiles)
         if provider == 'triton':
             ms, min_ms, max_ms = triton.testing.do_bench(lambda: lbmm(), quantiles=quantiles)
+        if provider == 'fla':
+            ms, min_ms, max_ms = triton.testing.do_bench(lambda: fla(), quantiles=quantiles)
         perf = lambda ms: ms
         
         if provider == 'triton':
             bmm_res = bmm()
             lbmm_res = lbmm()
-            print(f"outputs close: {torch.dist( bmm_res[0], lbmm_res[0] )} {torch.allclose(bmm_res[1], lbmm_res[1])} {torch.allclose(bmm_res[2], lbmm_res[2])}")
+            fla_res = fla()
+            print(f"beaver vs torch outputs close: {torch.dist( bmm_res[0], lbmm_res[0] )}")
+            print(f"beaver vs FLA outputs close: {torch.dist( lbmm_res[0], fla_res[0] )}")
             # print( torch.dist( bmm_res[0], lbmm_res[0] ), torch.dist( bmm_res[1], lbmm_res[1] ), torch.dist( bmm_res[2], lbmm_res[2] ) )
             # print( torch.dist( bmm_res[0], lbmm_res[0] ) )
         
@@ -93,7 +111,7 @@ if __name__ == '__main__':
         return perf(ms), perf(max_ms), perf(min_ms)
 
 
-    benchmark.run(show_plots=False, print_data=True)
+    benchmark.run(print_data=True)
     
     print()
     print( 'M,N,K,BLOCK_SIZE_M,BLOCK_SIZE_N,BLOCK_SIZE_K,GROUP_SIZE_M,num_warps,num_stages' )
@@ -108,3 +126,4 @@ if __name__ == '__main__':
             f"{v.num_stages}"
         )
     print()
+    

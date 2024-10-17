@@ -18,33 +18,24 @@ def cfg( M, N, K, G, num ):
     }
 
 
-# configs = [
-#     triton.Config( cfg( M=m, N=n, K=k, G=g, num=s ), num_stages=s, num_warps=w)
-#     for m in [ 32, 16 ]
-#     for n in [ 64, 32, 16 ]
-#     for k in [ 32, 16 ]
-#     for g in [ 1 ]
-#     for s in [ 2 ]
-#     for w in [ 4 ]
-# ]
-# configs = [
-#     triton.Config( cfg( M=m, N=n, K=k, G=g, num=s ), num_stages=s, num_warps=w)
-#     for m in [ 16 ]
-#     for n in [ 16 ]
-#     for k in [ 64, 32, 16, 8 ]
-#     for g in [ 1 ]
-#     for s in [ 2 ]
-#     for w in [ 4 ]
-# ]
 configs = [
     triton.Config( cfg( M=m, N=n, K=k, G=g, num=s ), num_stages=s, num_warps=w)
-    for m in [ 16 ]
-    for n in [ 16 ]
-    for k in [ 32 ]
+    for m in [ 32, 16 ]
+    for n in [ 64, 32, 16 ]
+    for k in [ 32, 16 ]
     for g in [ 1 ]
     for s in [ 2 ]
     for w in [ 4 ]
 ]
+# configs = [
+#     triton.Config( cfg( M=m, N=n, K=k, G=g, num=s ), num_stages=s, num_warps=w)
+#     for m in [ 16 ]
+#     for n in [ 16 ]
+#     for k in [ 32 ]
+#     for g in [ 1 ]
+#     for s in [ 2 ]
+#     for w in [ 4 ]
+# ]
 
 
 def keeper( conf ):
@@ -276,7 +267,9 @@ class BeaverMM(torch.autograd.Function):
         
         return dx, dy.transpose(-1, -2), None, None
 
-def rwkv_inner(r,k,v,w,u,kv_state,chunk_len:int=128,precision:int=64, do_log=False):
+
+@torch.compile
+def rwkv_inner(r,k,v,w,u,kv_state,chunk_len:int=128,precision:int=32):
     # assert(chunk_len <= 24 or precision == 64)
     """
     expects
@@ -359,49 +352,43 @@ def rwkv_inner(r,k,v,w,u,kv_state,chunk_len:int=128,precision:int=64, do_log=Fal
         wc_log_offset = shifted_wc_log_cum[...,T//2:T//2+1,:] # B,H,N,1,K
 
 
-        if do_log:
-            r_decay_logged = (shifted_wc_log_cum - wc_log_offset).to(precision_dtype)
-            k_inv_decay_logged = (wc_log_offset - wc_log_cum).to(precision_dtype)
+        r_decay_logged = (shifted_wc_log_cum - wc_log_offset).to(precision_dtype)
+        k_inv_decay_logged = (wc_log_offset - wc_log_cum).to(precision_dtype)
 
-            r_log, r_sign = r.abs().log(), r > 0
-            rxr = ( r_log + r_decay_logged )
+        r_log, r_sign = r.abs().log(), r > 0
+        rxr = ( r_log + r_decay_logged )
 
-            k_log, k_sign = k.abs().log(), k > 0
-            kxk = ( k_log + k_inv_decay_logged )
+        k_log, k_sign = k.abs().log(), k > 0
+        kxk = ( k_log + k_inv_decay_logged )
 
-            # a = lse_mm_real( rxr, kxk, r_sign, k_sign ).to( r.dtype ).tril(-1)
+        # a = lse_mm_real( rxr, kxk, r_sign, k_sign ).to( r.dtype ).tril(-1)
 
-            r_shape = rxr.shape
-            k_shape = kxk.shape
+        r_shape = rxr.shape
+        k_shape = kxk.shape
 
-            r_shape2 = [ -1, *r_shape[ -2 : ] ]
-            k_shape2 = [ -1, *k_shape[ -2 : ] ]
-            o_shape = [ *r_shape[ : -2 ], r_shape[-2], k_shape[-2] ]
+        r_shape2 = [ -1, *r_shape[ -2 : ] ]
+        k_shape2 = [ -1, *k_shape[ -2 : ] ]
+        o_shape = [ *r_shape[ : -2 ], r_shape[-2], k_shape[-2] ]
 
-            # uncomment the following if u want to run gradcheck in main loop, and also uncomment the one line in the kernel for float64
-            """
-            check_grad_impl = True
-            if check_grad_impl:
-                input = (rxr.view( r_shape2 ),
-                            kxk.view( k_shape2 ).mT.contiguous(),
-                            r_sign.view( r_shape2 ),
-                            k_sign.view( k_shape2 ).mT.contiguous())
-                print("checking BeaverMM gradients")
-                test = torch.autograd.gradcheck(BeaverMM.apply, input, eps=1e-6, atol=1e-4)
-                print(f"result of gradcheck: {test}")
-            """
-            
-            a = BeaverMM.apply(
-                rxr.view( r_shape2 ),
-                kxk.view( k_shape2 ).mT.contiguous(),
-                r_sign.view( r_shape2 ),
-                k_sign.view( k_shape2 ).mT.contiguous()
-            ).view( o_shape ).to(r.dtype)
-        else:
-            r_decay = (shifted_wc_log_cum - wc_log_offset).to(precision_dtype).exp() # B,H,N,T,K
-            k_inv_decay = (wc_log_offset - wc_log_cum).to(precision_dtype).exp() # B,H,N,T,K
-            a = ((r*r_decay) @ (k*k_inv_decay).mT).to(r.dtype).tril(-1) # B,H,N,T,T
-
+        # uncomment the following if u want to run gradcheck in main loop, and also uncomment the one line in the kernel for float64
+        """
+        check_grad_impl = True
+        if check_grad_impl:
+            input = (rxr.view( r_shape2 ),
+                        kxk.view( k_shape2 ).mT.contiguous(),
+                        r_sign.view( r_shape2 ),
+                        k_sign.view( k_shape2 ).mT.contiguous())
+            print("checking BeaverMM gradients")
+            test = torch.autograd.gradcheck(BeaverMM.apply, input, eps=1e-6, atol=1e-4)
+            print(f"result of gradcheck: {test}")
+        """
+        
+        a = BeaverMM.apply(
+            rxr.view( r_shape2 ),
+            kxk.view( k_shape2 ).mT.contiguous(),
+            r_sign.view( r_shape2 ),
+            k_sign.view( k_shape2 ).mT.contiguous()
+        ).view( o_shape ).to(r.dtype)
 
         # add u term to attention (NOTE - the tril(-1) above zeroed the diagonal)
         a = a + torch.einsum('bhntk,bhntk->bhnt', r, u * k).diag_embed()
