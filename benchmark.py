@@ -72,6 +72,8 @@ if __name__ == '__main__':
         u = torch.randn( [ 1, H, 1, K ], device='cuda' )
         kv_states = torch.zeros( [ B, H, K, K ], device='cuda' )
         
+        # songlin's FLA code expects w is already in logspace (referred to as g)
+        g = torch.log(w)
 
         def bmm():
             return rwkv_inner_pt( r, k, v, w, u, kv_states, chunk_len, 64 )
@@ -83,7 +85,7 @@ if __name__ == '__main__':
             return rwkv_inner_triton( r, k, v, w, u, kv_states, chunk_len, 32 )
         
         def fla():
-            return rwkv_fla( r, k, v, w, u, None, kv_states )
+            return rwkv_fla( r, k, v, g, u, None, kv_states )
         
         quantiles = [0.5, 0.2, 0.8]
         if provider == 'torch':
@@ -100,6 +102,7 @@ if __name__ == '__main__':
             bmm_res = bmm()
             lbmm_res = lbmm()
             fla_res = fla()
+            print(lbmm_res[0])
             print(f"beaver vs torch outputs close: {torch.dist( bmm_res[0], lbmm_res[0] )}")
             print(f"beaver vs FLA outputs close: {torch.dist( lbmm_res[0], fla_res[0] )}")
             # print( torch.dist( bmm_res[0], lbmm_res[0] ), torch.dist( bmm_res[1], lbmm_res[1] ), torch.dist( bmm_res[2], lbmm_res[2] ) )

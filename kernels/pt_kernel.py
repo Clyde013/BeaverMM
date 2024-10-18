@@ -1,3 +1,5 @@
+# adapted from https://github.com/RWKV/RWKV-infctx-trainer/blob/main/RWKV-v6/src/module/rwkv_inner.py
+
 import torch
 import torch.nn.functional as F
 

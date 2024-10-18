@@ -1,3 +1,6 @@
+# adapted from https://github.com/RWKV/RWKV-infctx-trainer/blob/main/RWKV-v6/src/module/rwkv_inner.py
+# although there is a chunk_len param, this algorithm is not chunked (as of yet)
+
 import torch
 import torch.nn.functional as F
 
@@ -267,8 +270,7 @@ class BeaverMM(torch.autograd.Function):
         
         return dx, dy.transpose(-1, -2), None, None
 
-
-@torch.compile
+@torch.compile(options={"trace.enabled":True})
 def rwkv_inner(r,k,v,w,u,kv_state,chunk_len:int=128,precision:int=32):
     # assert(chunk_len <= 24 or precision == 64)
     """
