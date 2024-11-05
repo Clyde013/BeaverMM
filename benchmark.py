@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+import logging
 
 import os 
 # os.environ['TRITON_INTERPRET'] = '1'
@@ -8,7 +9,7 @@ import triton
 import triton.language as tl
 from triton.runtime import driver
 
-from kernels.beaver_kernel import kernel_lbmm_fwd
+from kernels.beaver_kernel import kernel_lbmm_fwd, beaver_forward
 from kernels.beaver_kernel import rwkv_inner as rwkv_inner_triton
 
 from kernels.fla.fla_rwkv6 import chunk_rwkv6 as rwkv_fla
@@ -16,11 +17,12 @@ from kernels.fla.fla_rwkv6 import chunk_rwkv6 as rwkv_fla
 from kernels.pt_kernel import rwkv_inner as rwkv_inner_pt
 from kernels.pt_kernel import rwkv_inner_compiled as rwkv_inner_pt_compiled
 
-if __name__ == '__main__':    
+if __name__ == '__main__':
+    
+    torch.set_printoptions(threshold=1000, edgeitems=8, linewidth=160, sci_mode=False)
+    torch.manual_seed(42)
     
     # checking gradients of backward implementation
-    # uncomment two parts above, one in kernel for float64 and one in the do_log part of rwkv_inner
-    torch.manual_seed(42)
     """
     B = 2
     H = 2
@@ -28,18 +30,27 @@ if __name__ == '__main__':
     L = 2
     chunk_len = L
     
-    torch.set_printoptions(threshold=1000, edgeitems=8, linewidth=160, sci_mode=False)
-        
     r = torch.randn( [ B, H, L, K ], device='cuda', requires_grad=True )
     k = torch.randn( [ B, H, L, K ], device='cuda', requires_grad=True )
-    v = torch.randn( [ B, H, L, K ] , device='cuda', requires_grad=True )
+    v = torch.randn( [ B, H, L, K ], device='cuda', requires_grad=True )
     w = torch.rand( [ B, H, L, K ], device='cuda', requires_grad=True )
     u = torch.randn( [ 1, H, 1, K ], device='cuda', requires_grad=True )
-    kv_states = torch.zeros( [ B, H, K, K ], device='cuda' )
-    rwkv_inner( r, k, v, w, u, kv_states, chunk_len, 64, True )
-    """
-    # Speed benchmark
+    kv_states = torch.zeros( [ B, H, K, K ],  device='cuda' )
     
+    # sets the last arg check_grad_impl to True to run gradcheck. But the gradcheck doesn't work with torch.compile, so comment out the line
+    # that is torch compiling rwkv_inner_triton, and also requires you to manually go through the kernel_fwd and set o = tl.zeros( ... , dtype=tl.float64 )
+    # for additional precision required for gradcheck
+    rwkv_inner_triton( r, k, v, w, u, kv_states, chunk_len, 64, True )
+    """
+    
+    
+    # opcheck for beavermm torch.library.custom_op, will check both forward and backward pass
+    temp_r, temp_k = torch.randn( [256, 192, 64], device='cuda', requires_grad=True ), torch.randn( [256, 64, 192], device='cuda', requires_grad=True )
+    temp_r_sign, temp_k_sign = temp_r > 0, temp_k > 0
+    torch.library.opcheck(beaver_forward, (temp_r, temp_k.contiguous(), temp_r_sign, temp_k_sign.contiguous()))
+    
+
+    # Speed benchmark
     bench_configs = []
     
     bench_configs.append(
@@ -100,9 +111,12 @@ if __name__ == '__main__':
         
         if provider == 'triton':
             bmm_res = bmm()
+            bmm_comp_res = bmm_compiled()
             lbmm_res = lbmm()
             fla_res = fla()
-            print(lbmm_res[0])
+        
+            #print(lbmm_res[0])
+            print(f"torch vs torch_compiled outputs close: {torch.dist( bmm_res[0], bmm_comp_res[0] )}")
             print(f"beaver vs torch outputs close: {torch.dist( bmm_res[0], lbmm_res[0] )}")
             print(f"beaver vs FLA outputs close: {torch.dist( lbmm_res[0], fla_res[0] )}")
             # print( torch.dist( bmm_res[0], lbmm_res[0] ), torch.dist( bmm_res[1], lbmm_res[1] ), torch.dist( bmm_res[2], lbmm_res[2] ) )

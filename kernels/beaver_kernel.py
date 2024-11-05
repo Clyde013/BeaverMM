@@ -1,11 +1,10 @@
 # adapted from https://github.com/RWKV/RWKV-infctx-trainer/blob/main/RWKV-v6/src/module/rwkv_inner.py
 # although there is a chunk_len param, this algorithm is not chunked (as of yet)
 
+import typing
+
 import torch
 import torch.nn.functional as F
-
-import os 
-# os.environ['TRITON_INTERPRET'] = '1'
 
 import triton
 import triton.language as tl
@@ -196,7 +195,7 @@ def kernel_lbmm_bwd(
             
             # random mem leaks might occur if there is no masking here
             grad_out_ptrs = grad_out_ptr + offs_x_m * stride_grad_m + offs_y_n.trans(1, 0) * stride_grad_n  # (M, 1) + (1, N)
-            grad_mask = (offs_x_m < M) & (offs_y_n < N)
+            grad_mask = (offs_x_m < M) & (offs_y_n.trans(1, 0) < N)
             grad_out = tl.load( grad_out_ptrs, mask=grad_mask )[:,:,None]   # (M,N,1)
             
             dxy = z_exp_masked * grad_out   # (M,N,K) * (M,N,1)
@@ -210,68 +209,96 @@ def kernel_lbmm_bwd(
             
             tl.store(dx_ptrs, dx, mask=dx_mask)
             tl.store(dy_ptrs, dy, mask=dy_mask)
+            
+
+# unwrapped beaver kernel into pytorch custom operator with register_autograd
+# if wrapped into torch.autograd.Function Inductor backend shits itself and not-so silently
+# compiles the function incorrectly, throwing ZeroDivisionErrors and NaNs.
+# ref: https://pytorch.org/tutorials/advanced/python_custom_ops.html#adding-training-support-for-crop
+
+@torch.library.custom_op("beavermm::beaver_forward", mutates_args=())
+def beaver_forward( x_log: torch.Tensor, y_log: torch.Tensor, x_sign: torch.Tensor, y_sign: torch.Tensor ) -> torch.Tensor:
+    B, M, K = x_log.shape
+    _, K, N = y_log.shape
+
+    assert (K % 32 == 0), "K must be divisible by 32"
+
+    output = torch.zeros((B, M, N), device = x_log.device, dtype = x_log.dtype)
     
+    grid = lambda META: (
+        B, triton.cdiv(M, META['BLOCK_SIZE_M']),
+    )
+
+    kernel_lbmm_fwd[grid](
+        x_log, y_log,
+        x_sign, y_sign,
+        output,
+        M, N, K,
+        x_log.stride(0), x_log.stride(1), x_log.stride(2),
+        y_log.stride(0), y_log.stride(1), y_log.stride(2),
+        x_sign.stride(0), x_sign.stride(1), x_sign.stride(2),
+        y_sign.stride(0), y_sign.stride(1), y_sign.stride(2),
+        output.stride(0), output.stride(1), output.stride(2),
+    )
+    return output
+
+@beaver_forward.register_fake
+def _(x_log, y_log, x_sign, y_sign):
+    B, M, K = x_log.shape
+    _, K, N = y_log.shape
+    return torch.empty((B, M, N), device = x_log.device, dtype = x_log.dtype)
+
+# it is necessary here to wrap the triton kernel into a custom_op even if it is backward pass.
+# the backward pass must be composed of only pytorch understood operators, and cannot have a raw triton kernel
+# call in it, so we have to wrap the triton kernel into another custom_op first, then call backward function.
+@torch.library.custom_op("beavermm::beaver_backward", mutates_args=())
+def beaver_backward( x_log: torch.Tensor, y_log: torch.Tensor, x_sign: torch.Tensor, y_sign: torch.Tensor, grad_output: torch.Tensor ) -> typing.Tuple[torch.Tensor, torch.Tensor]:
+    B, M, K = x_log.shape
+    _, K, N = y_log.shape
+    dx = torch.zeros((B, M, K), device = x_log.device, dtype = x_log.dtype)
+    dy = torch.zeros((B, N, K), device = x_log.device, dtype = x_log.dtype)
     
-class BeaverMM(torch.autograd.Function):
-    @staticmethod
-    def forward( ctx, x_log, y_log, x_sign, y_sign ):
-        B, M, K = x_log.shape
-        _, K, N = y_log.shape
-        ctx.save_for_backward(x_log, y_log, x_sign, y_sign)
+    grid = lambda META: (
+        B, triton.cdiv(M, META['BLOCK_SIZE_M']),
+    )
 
-        assert (K % 32 == 0), "K must be divisible by 32"
+    kernel_lbmm_bwd[grid](
+        x_log, y_log,
+        x_sign, y_sign,
+        grad_output,
+        dx, dy,
+        M, N, K,
+        x_log.stride(0), x_log.stride(1), x_log.stride(2),
+        y_log.stride(0), y_log.stride(1), y_log.stride(2),
+        x_sign.stride(0), x_sign.stride(1), x_sign.stride(2),
+        y_sign.stride(0), y_sign.stride(1), y_sign.stride(2),
+        grad_output.stride(0), grad_output.stride(1), grad_output.stride(2),
+        dx.stride(0), dx.stride(1), dx.stride(2),
+        dy.stride(0), dy.stride(1), dy.stride(2),
+    )
+    return dx, dy.transpose(-1, -2)
 
-        output = torch.zeros((B, M, N), device = x_log.device, dtype = x_log.dtype)
-        
-        grid = lambda META: (
-            B, triton.cdiv(M, META['BLOCK_SIZE_M']),
-        )
+@beaver_backward.register_fake
+def _(x_log, y_log, x_sign, y_sign, grad_output):
+    B, M, K = x_log.shape
+    _, K, N = y_log.shape
+    dx = torch.empty((B, M, K))
+    dy = torch.empty((B, K, N))
+    return dx, dy
 
-        kernel_lbmm_fwd[grid](
-            x_log, y_log,
-            x_sign, y_sign,
-            output,
-            M, N, K,
-            x_log.stride(0), x_log.stride(1), x_log.stride(2),
-            y_log.stride(0), y_log.stride(1), y_log.stride(2),
-            x_sign.stride(0), x_sign.stride(1), x_sign.stride(2),
-            y_sign.stride(0), y_sign.stride(1), y_sign.stride(2),
-            output.stride(0), output.stride(1), output.stride(2),
-        )
-        return output
-    
-    @staticmethod
-    def backward( ctx, grad_output ):
-        x_log, y_log, x_sign, y_sign = ctx.saved_tensors
-        
-        B, M, K = x_log.shape
-        _, K, N = y_log.shape
-        dx = torch.zeros((B, M, K), device = x_log.device, dtype = x_log.dtype)
-        dy = torch.zeros((B, N, K), device = x_log.device, dtype = x_log.dtype)
-        
-        grid = lambda META: (
-            B, triton.cdiv(M, META['BLOCK_SIZE_M']),
-        )
+def beaver_backward_wrapper( ctx: typing.Any, grad_output: torch.Tensor ):
+    x_log, y_log, x_sign, y_sign = ctx.x_log, ctx.y_log, ctx.x_sign, ctx.y_sign
+    dx, dy = beaver_backward(x_log, y_log, x_sign, y_sign, grad_output)
+    return dx, dy, None, None
 
-        kernel_lbmm_bwd[grid](
-            x_log, y_log,
-            x_sign, y_sign,
-            grad_output,
-            dx, dy,
-            M, N, K,
-            x_log.stride(0), x_log.stride(1), x_log.stride(2),
-            y_log.stride(0), y_log.stride(1), y_log.stride(2),
-            x_sign.stride(0), x_sign.stride(1), x_sign.stride(2),
-            y_sign.stride(0), y_sign.stride(1), y_sign.stride(2),
-            grad_output.stride(0), grad_output.stride(1), grad_output.stride(2),
-            dx.stride(0), dx.stride(1), dx.stride(2),
-            dy.stride(0), dy.stride(1), dy.stride(2),
-        )
-        
-        return dx, dy.transpose(-1, -2), None, None
+def setup_context(ctx, inputs, output):
+    ctx.x_log, ctx.y_log, ctx.x_sign, ctx.y_sign = inputs
 
-@torch.compile(options={"trace.enabled":True})
-def rwkv_inner(r,k,v,w,u,kv_state,chunk_len:int=128,precision:int=32):
+beaver_forward.register_autograd(beaver_backward_wrapper, setup_context=setup_context)
+
+
+@torch.compile(backend="inductor")
+def rwkv_inner(r,k,v,w,u,kv_state, chunk_len:int=128, precision:int=32, check_grad_impl:bool=False):
     # assert(chunk_len <= 24 or precision == 64)
     """
     expects
@@ -353,7 +380,6 @@ def rwkv_inner(r,k,v,w,u,kv_state,chunk_len:int=128,precision:int=32):
         # parallel calculation of all intra-chunk attention contributions
         wc_log_offset = shifted_wc_log_cum[...,T//2:T//2+1,:] # B,H,N,1,K
 
-
         r_decay_logged = (shifted_wc_log_cum - wc_log_offset).to(precision_dtype)
         k_inv_decay_logged = (wc_log_offset - wc_log_cum).to(precision_dtype)
 
@@ -373,19 +399,15 @@ def rwkv_inner(r,k,v,w,u,kv_state,chunk_len:int=128,precision:int=32):
         o_shape = [ *r_shape[ : -2 ], r_shape[-2], k_shape[-2] ]
 
         # uncomment the following if u want to run gradcheck in main loop, and also uncomment the one line in the kernel for float64
-        """
-        check_grad_impl = True
         if check_grad_impl:
             input = (rxr.view( r_shape2 ),
                         kxk.view( k_shape2 ).mT.contiguous(),
                         r_sign.view( r_shape2 ),
                         k_sign.view( k_shape2 ).mT.contiguous())
-            print("checking BeaverMM gradients")
-            test = torch.autograd.gradcheck(BeaverMM.apply, input, eps=1e-6, atol=1e-4)
-            print(f"result of gradcheck: {test}")
-        """
+            test = torch.autograd.gradcheck(beaver_forward, input, eps=1e-6, atol=1e-4)
+            assert test
         
-        a = BeaverMM.apply(
+        a = beaver_forward(
             rxr.view( r_shape2 ),
             kxk.view( k_shape2 ).mT.contiguous(),
             r_sign.view( r_shape2 ),
