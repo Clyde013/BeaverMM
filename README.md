@@ -19,5 +19,7 @@ matmul-performance-k64:
 ```
 
 ## TODO
-1. More modular debugging tools like gradcheck unit tests, just QoL script to improve the experience of iterating on the kernel code.
+1. Fuse the beaver operations somehow. Calculate the log of q, k (x, y), and the signs inside the kernel?
+1. Compare to Gated Linear Attention (GLA)
 1. Some form of swizzling for beaver kernel implementation to increase L2 cache hitrate and maybe close the gap with FLA a bit.
+~~1. More modular debugging tools like gradcheck unit tests, just QoL script to improve the experience of iterating on the kernel code.~~
